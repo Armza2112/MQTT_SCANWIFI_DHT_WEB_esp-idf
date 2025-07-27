@@ -20,32 +20,27 @@
 #include "cJSON.h"
 #include "esp_spiffs.h"
 
-#define MAXIMUM_AP 20
-
-// ==== WiFi Config ====
+// define Var
 #define WIFI_SSID "ESP32"
 #define WIFI_PASS "12345678"
-#define WIFI_CHANNEL 1
-#define MAX_STA_CONN 4
+#define MAXIMUM_AP 20
 #define HISTORY_SIZE 100
-#define DHT_GPIO GPIO_NUM_13
+#define MAX_STA_CONN 4
+#define WIFI_CHANNEL 1
 #define WIFI_CONNECTED_BIT BIT0
+
+// define GPIO
+#define DHT_GPIO GPIO_NUM_13
 
 // declare function
 void wifi_connect(const char *ssid, const char *password);
 void wifi_scan_task(void *pvParameters);
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+void add_sensor_reading(float temp, float hum, time_t timestamp);
+void mqtt_reconnect(void *pvParameters);
 esp_err_t restart_handle(httpd_req_t *req);
 esp_err_t connect_post_handler(httpd_req_t *req);
-wifi_ap_record_t scanned_aps[MAXIMUM_AP];
-uint16_t scanned_ap_count = 0;
-TaskHandle_t main_task_handle = NULL;
 esp_err_t connect_post_handler(httpd_req_t *req);
-static EventGroupHandle_t wifi_event_group;
-esp_mqtt_client_handle_t mqtt_client = NULL;
-static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
-static EventGroupHandle_t wifi_event_group;
-void add_sensor_reading(float temp, float hum, time_t timestamp);
-static volatile bool wifi_connect_failed = false;
 
 // TAG
 static const char *TAG_SCAN = "wifi_scan";
@@ -55,11 +50,20 @@ static const char *TAG_RE = "Reconnect";
 static const char *TAG_MQTT = "MQTT";
 static const char *TAG_DHT22 = "DHT";
 
+// declare var
+esp_mqtt_client_handle_t mqtt_client = NULL;
+wifi_ap_record_t scanned_aps[MAXIMUM_AP];
+uint16_t scanned_ap_count = 0;
+TaskHandle_t main_task_handle = NULL;
+static EventGroupHandle_t wifi_event_group;
+static EventGroupHandle_t wifi_event_group;
+static volatile bool wifi_connect_failed = false;
 float temp_history[HISTORY_SIZE] = {NAN};
 float hum_history[HISTORY_SIZE] = {NAN};
 time_t time_history[HISTORY_SIZE] = {0};
 int history_index = 0;
 
+/* Spiffs */
 void init_spiffs()
 {
     esp_vfs_spiffs_conf_t conf = {
@@ -78,7 +82,9 @@ void init_spiffs()
         ESP_LOGI("SPIFFS", "SPIFFS mounted successfully");
     }
 }
-// sync time
+/* Spiffs */
+
+/* Sync time */
 void initialize_sntp(void)
 {
     ESP_LOGI("SNTP", "Initializing SNTP");
@@ -111,8 +117,8 @@ void wait_for_time_sync(void)
         ESP_LOGI("SNTP", "Time synchronized: %s", asctime(&timeinfo));
     }
 }
-// sync time
-
+/* Sync time */
+/* WIFI Setup */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
@@ -191,8 +197,220 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         }
     }
 }
+void wifi_connect(const char *ssid, const char *password)
+{
+    wifi_config_t wifi_sta_config = {0};
 
-/*WEB PAGE*/
+    strncpy((char *)wifi_sta_config.sta.ssid, ssid, sizeof(wifi_sta_config.sta.ssid));
+    strncpy((char *)wifi_sta_config.sta.password, password, sizeof(wifi_sta_config.sta.password));
+
+    ESP_LOGI(TAG_AP, "Connecting to SSID: %s", ssid);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
+
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_ERROR_CHECK(esp_wifi_connect());
+}
+
+
+static const char *auth_mode_type(wifi_auth_mode_t auth_mode)
+{
+    switch (auth_mode)
+    {
+    case WIFI_AUTH_OPEN:
+        return "OPEN";
+    case WIFI_AUTH_WEP:
+        return "WEP";
+    case WIFI_AUTH_WPA_PSK:
+        return "WPA PSK";
+    case WIFI_AUTH_WPA2_PSK:
+        return "WPA2 PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK:
+        return "WPA WPA2 PSK";
+    case WIFI_AUTH_WPA3_PSK:
+        return "WPA3 PSK";
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+        return "WPA2 WPA3 PSK";
+    case WIFI_AUTH_WAPI_PSK:
+        return "WAPI PSK";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+void wifi_init_apsta(void)
+{
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    wifi_config_t wifi_ap_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .channel = WIFI_CHANNEL,
+            .password = WIFI_PASS,
+            .max_connection = MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+    if (strlen(WIFI_PASS) == 0)
+    {
+        wifi_ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config));
+
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG_AP, "SoftAP started. SSID:%s, password:%s", WIFI_SSID, WIFI_PASS);
+}
+
+void wifi_scan_task(void *pvParameters)
+{
+    while (1)
+    {
+        wifi_ap_record_t connected_info;
+        esp_err_t connected = esp_wifi_sta_get_ap_info(&connected_info);
+        if (connected == ESP_OK)
+        {
+            ESP_LOGI(TAG_SCAN, "Connected to SSID: %s. Stop scanning.", (char *)connected_info.ssid);
+            vTaskDelete(NULL);
+            return;
+        }
+        wifi_mode_t mode;
+        esp_err_t err_mode = esp_wifi_get_mode(&mode);
+        if (err_mode != ESP_OK || mode == WIFI_MODE_NULL)
+        {
+            ESP_LOGE(TAG_SCAN, "Wi-Fi not initialized. Abort scan.");
+            vTaskDelete(NULL);
+            return;
+        }
+
+        wifi_scan_config_t scan_config = {
+            .ssid = NULL,
+            .bssid = NULL,
+            .channel = 0,
+            .show_hidden = true};
+
+        ESP_LOGI(TAG_SCAN, "Starting scan...");
+        esp_err_t err_scan = esp_wifi_scan_start(&scan_config, true);
+        if (err_scan != ESP_OK)
+        {
+            ESP_LOGE(TAG_SCAN, "Scan start failed: %s", esp_err_to_name(err_scan));
+            vTaskDelete(NULL);
+            return;
+        }
+
+        uint16_t ap_num = MAXIMUM_AP;
+        wifi_ap_record_t ap_records[MAXIMUM_AP];
+        memset(ap_records, 0, sizeof(ap_records));
+
+        esp_err_t err_get = esp_wifi_scan_get_ap_records(&ap_num, ap_records);
+        if (err_get != ESP_OK)
+        {
+            ESP_LOGE(TAG_SCAN, "Failed to get AP records: %s", esp_err_to_name(err_get));
+            vTaskDelete(NULL);
+            return;
+        }
+
+        ESP_LOGI(TAG_SCAN, "Found %d APs", ap_num);
+        vTaskDelay(pdMS_TO_TICKS(10000)); // delay 10 seconds
+
+        for (int i = 0; i < ap_num; i++)
+        {
+            char ssid[33] = {0};
+            memcpy(ssid, ap_records[i].ssid, sizeof(ap_records[i].ssid));
+            ssid[32] = '\0';
+            if (strlen(ssid) == 0)
+            {
+                ESP_LOGI(TAG_SCAN, "AP %d: SSID: <hidden>, Channel: %d, RSSI: %d, Authmode: %s",
+                         i, ap_records[i].primary, ap_records[i].rssi,
+                         auth_mode_type(ap_records[i].authmode));
+            }
+            else
+            {
+                ESP_LOGI(TAG_SCAN, "AP %d: SSID: %s, Channel: %d, RSSI: %d, Authmode: %s",
+                         i, ssid, ap_records[i].primary, ap_records[i].rssi,
+                         auth_mode_type(ap_records[i].authmode));
+            }
+        }
+        scanned_ap_count = ap_num;
+        memcpy(scanned_aps, ap_records, sizeof(wifi_ap_record_t) * ap_num);
+        if (main_task_handle != NULL)
+        {
+            xTaskNotifyGive(main_task_handle);
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+void connect_wifi_nvs()
+{
+    char ssid[33] = {0};
+    char password[65] = {0};
+    size_t ssid_len = sizeof(ssid);
+    size_t pass_len = sizeof(password);
+
+    nvs_handle_t nvs_handle;
+    wifi_ap_record_t ap_info;
+    esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
+    esp_err_t err = nvs_open("wifi_creds", NVS_READONLY, &nvs_handle);
+    if (err == ESP_OK)
+    {
+        if (nvs_get_str(nvs_handle, "ssid", ssid, &ssid_len) == ESP_OK &&
+            nvs_get_str(nvs_handle, "password", password, &pass_len) == ESP_OK)
+        {
+
+            wifi_connect(ssid, password);
+            if (ret == ESP_OK)
+            {
+                ESP_LOGI(TAG_AP, "Connecting to saved wifi: SSID=%s", ssid);
+            }
+            else
+            {
+                ESP_LOGI(TAG_RE, "Can't Connecting: %s", ssid);
+            }
+        }
+        else
+        {
+            ESP_LOGI(TAG_AP, "No wifi credentials in NVS");
+        }
+        nvs_close(nvs_handle);
+    }
+    else
+    {
+        ESP_LOGI(TAG_AP, "Cannot open NVS");
+    }
+}
+/* WIFI Setup */
+/* WEB PAGE */
 esp_err_t home(httpd_req_t *req)
 {
     wifi_config_t sta_config;
@@ -477,23 +695,6 @@ static httpd_handle_t start_webserver(void)
 
     return server;
 }
-void wifi_connect(const char *ssid, const char *password)
-{
-    wifi_config_t wifi_sta_config = {0};
-
-    strncpy((char *)wifi_sta_config.sta.ssid, ssid, sizeof(wifi_sta_config.sta.ssid));
-    strncpy((char *)wifi_sta_config.sta.password, password, sizeof(wifi_sta_config.sta.password));
-
-    ESP_LOGI(TAG_AP, "Connecting to SSID: %s", ssid);
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
-
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_ERROR_CHECK(esp_wifi_connect());
-}
 esp_err_t connect_post_handler(httpd_req_t *req)
 {
     char buf[256];
@@ -580,162 +781,6 @@ esp_err_t connect_post_handler(httpd_req_t *req)
     }
     return ESP_OK;
 }
-
-static const char *auth_mode_type(wifi_auth_mode_t auth_mode)
-{
-    switch (auth_mode)
-    {
-    case WIFI_AUTH_OPEN:
-        return "OPEN";
-    case WIFI_AUTH_WEP:
-        return "WEP";
-    case WIFI_AUTH_WPA_PSK:
-        return "WPA PSK";
-    case WIFI_AUTH_WPA2_PSK:
-        return "WPA2 PSK";
-    case WIFI_AUTH_WPA_WPA2_PSK:
-        return "WPA WPA2 PSK";
-    case WIFI_AUTH_WPA3_PSK:
-        return "WPA3 PSK";
-    case WIFI_AUTH_WPA2_WPA3_PSK:
-        return "WPA2 WPA3 PSK";
-    case WIFI_AUTH_WAPI_PSK:
-        return "WAPI PSK";
-    default:
-        return "UNKNOWN";
-    }
-}
-
-void wifi_init_apsta(void)
-{
-    ESP_ERROR_CHECK(nvs_flash_init());
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    esp_netif_create_default_wifi_sta();
-    esp_netif_create_default_wifi_ap();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-
-    wifi_config_t wifi_ap_config = {
-        .ap = {
-            .ssid = WIFI_SSID,
-            .ssid_len = strlen(WIFI_SSID),
-            .channel = WIFI_CHANNEL,
-            .password = WIFI_PASS,
-            .max_connection = MAX_STA_CONN,
-            .authmode = WIFI_AUTH_WPA2_PSK,
-            .pmf_cfg = {
-                .required = false,
-            },
-        },
-    };
-    if (strlen(WIFI_PASS) == 0)
-    {
-        wifi_ap_config.ap.authmode = WIFI_AUTH_OPEN;
-    }
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config));
-
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG_AP, "SoftAP started. SSID:%s, password:%s", WIFI_SSID, WIFI_PASS);
-}
-
-void wifi_scan_task(void *pvParameters)
-{
-    while (1)
-    {
-        wifi_ap_record_t connected_info;
-        esp_err_t connected = esp_wifi_sta_get_ap_info(&connected_info);
-        if (connected == ESP_OK)
-        {
-            ESP_LOGI(TAG_SCAN, "Connected to SSID: %s. Stop scanning.", (char *)connected_info.ssid);
-            vTaskDelete(NULL);
-            return;
-        }
-        wifi_mode_t mode;
-        esp_err_t err_mode = esp_wifi_get_mode(&mode);
-        if (err_mode != ESP_OK || mode == WIFI_MODE_NULL)
-        {
-            ESP_LOGE(TAG_SCAN, "Wi-Fi not initialized. Abort scan.");
-            vTaskDelete(NULL);
-            return;
-        }
-
-        wifi_scan_config_t scan_config = {
-            .ssid = NULL,
-            .bssid = NULL,
-            .channel = 0,
-            .show_hidden = true};
-
-        ESP_LOGI(TAG_SCAN, "Starting scan...");
-        esp_err_t err_scan = esp_wifi_scan_start(&scan_config, true);
-        if (err_scan != ESP_OK)
-        {
-            ESP_LOGE(TAG_SCAN, "Scan start failed: %s", esp_err_to_name(err_scan));
-            vTaskDelete(NULL);
-            return;
-        }
-
-        uint16_t ap_num = MAXIMUM_AP;
-        wifi_ap_record_t ap_records[MAXIMUM_AP];
-        memset(ap_records, 0, sizeof(ap_records));
-
-        esp_err_t err_get = esp_wifi_scan_get_ap_records(&ap_num, ap_records);
-        if (err_get != ESP_OK)
-        {
-            ESP_LOGE(TAG_SCAN, "Failed to get AP records: %s", esp_err_to_name(err_get));
-            vTaskDelete(NULL);
-            return;
-        }
-
-        ESP_LOGI(TAG_SCAN, "Found %d APs", ap_num);
-        vTaskDelay(pdMS_TO_TICKS(10000)); // delay 10 seconds
-
-        for (int i = 0; i < ap_num; i++)
-        {
-            char ssid[33] = {0};
-            memcpy(ssid, ap_records[i].ssid, sizeof(ap_records[i].ssid));
-            ssid[32] = '\0';
-            if (strlen(ssid) == 0)
-            {
-                ESP_LOGI(TAG_SCAN, "AP %d: SSID: <hidden>, Channel: %d, RSSI: %d, Authmode: %s",
-                         i, ap_records[i].primary, ap_records[i].rssi,
-                         auth_mode_type(ap_records[i].authmode));
-            }
-            else
-            {
-                ESP_LOGI(TAG_SCAN, "AP %d: SSID: %s, Channel: %d, RSSI: %d, Authmode: %s",
-                         i, ssid, ap_records[i].primary, ap_records[i].rssi,
-                         auth_mode_type(ap_records[i].authmode));
-            }
-        }
-        scanned_ap_count = ap_num;
-        memcpy(scanned_aps, ap_records, sizeof(wifi_ap_record_t) * ap_num);
-        if (main_task_handle != NULL)
-        {
-            xTaskNotifyGive(main_task_handle);
-        }
-    }
-
-    vTaskDelete(NULL);
-}
 esp_err_t restart_handle(httpd_req_t *req)
 {
     const char *resp = "<html><body><h1>Restarting...</h1></body></html>";
@@ -747,6 +792,8 @@ esp_err_t restart_handle(httpd_req_t *req)
 
     return ESP_OK;
 }
+/* WEB PAGE */
+/* Read Sensor */
 void read_dht()
 {
     setDHTgpio(DHT_GPIO);
@@ -782,7 +829,16 @@ void read_dht()
         vTaskDelay(pdMS_TO_TICKS(60000));
     }
 }
-/*MQTT*/
+void add_sensor_reading(float temp, float hum, time_t timestamp)
+{
+    temp_history[history_index] = temp;
+    hum_history[history_index] = hum;
+    time_history[history_index] = timestamp;
+
+    history_index = (history_index + 1) % HISTORY_SIZE;
+}
+/* Read Sensor */
+/* MQTT */
 void mqtt_init()
 {
     wifi_event_group = xEventGroupCreate();
@@ -798,6 +854,19 @@ void mqtt_init()
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(mqtt_client);
+    xTaskCreate(&mqtt_reconnect, "mqtt_reconnect", 4096, NULL, 5, NULL);
+}
+void mqtt_reconnect(void *pvParameters)
+{
+    while (1)
+    {
+        if (!esp_mqtt_client_disconnect(mqtt_client))
+        {
+            ESP_LOGW("MQTT", "Not connected, reconnecting...");
+            esp_mqtt_client_reconnect(mqtt_client);
+        }
+        vTaskDelay(pdMS_TO_TICKS(60000)); 
+    }
 }
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -819,15 +888,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     }
 }
-void add_sensor_reading(float temp, float hum, time_t timestamp)
-{
-    temp_history[history_index] = temp;
-    hum_history[history_index] = hum;
-    time_history[history_index] = timestamp;
-
-    history_index = (history_index + 1) % HISTORY_SIZE;
-}
-
 void mqtt_publish_task(void *pvParameters)
 {
     setDHTgpio(DHT_GPIO);
@@ -876,7 +936,7 @@ void mqtt_publish_task(void *pvParameters)
     }
 }
 
-void sensor_to_spiffs()
+void mqtt_sensor_to_spiffs()
 {
     vTaskDelay(pdMS_TO_TICKS(2000));
 
@@ -913,7 +973,7 @@ void log_to_mqtt()
         FILE *f = fopen("/spiffs/log.txt", "r");
         if (f == NULL)
         {
-            ESP_LOGE("LOG", "❌ Failed to open log.txt");
+            ESP_LOGE("LOG", "Failed to open log.txt");
             return;
         }
 
@@ -946,50 +1006,13 @@ void log_to_mqtt()
         strcat(json, "]");
         fclose(f);
 
-        int msg_id = esp_mqtt_client_publish(mqtt_client, "/device/logs", json, 0, 1, 0);
-        ESP_LOGI("MQTT", "📤 Sent JSON log via MQTT, msg_id=%d", msg_id);
+        int msg_id = esp_mqtt_client_publish(mqtt_client, "/sensor/logs", json, 0, 1, 0);
+        ESP_LOGI("MQTT", "Sent JSON log via MQTT, msg_id=%d", msg_id);
         vTaskDelay(pdMS_TO_TICKS(60000));
     }
 }
 /*MQTT*/
-void connect_wifi_nvs()
-{
-    char ssid[33] = {0};
-    char password[65] = {0};
-    size_t ssid_len = sizeof(ssid);
-    size_t pass_len = sizeof(password);
 
-    nvs_handle_t nvs_handle;
-    wifi_ap_record_t ap_info;
-    esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
-    esp_err_t err = nvs_open("wifi_creds", NVS_READONLY, &nvs_handle);
-    if (err == ESP_OK)
-    {
-        if (nvs_get_str(nvs_handle, "ssid", ssid, &ssid_len) == ESP_OK &&
-            nvs_get_str(nvs_handle, "password", password, &pass_len) == ESP_OK)
-        {
-
-            wifi_connect(ssid, password);
-            if (ret == ESP_OK)
-            {
-                ESP_LOGI(TAG_AP, "Connecting to saved wifi: SSID=%s", ssid);
-            }
-            else
-            {
-                ESP_LOGI(TAG_RE, "Can't Connecting: %s", ssid);
-            }
-        }
-        else
-        {
-            ESP_LOGI(TAG_AP, "No wifi credentials in NVS");
-        }
-        nvs_close(nvs_handle);
-    }
-    else
-    {
-        ESP_LOGI(TAG_AP, "Cannot open NVS");
-    }
-}
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
@@ -999,7 +1022,7 @@ void app_main(void)
     wifi_init_apsta();
     init_spiffs();
     xTaskCreate(&read_dht, "read_dht", 4096, NULL, 5, NULL);
-    xTaskCreate(&sensor_to_spiffs, "sensor_to_spiffs", 4096, NULL, 5, NULL);
+    xTaskCreate(&mqtt_sensor_to_spiffs, "mqtt_sensor_to_spiffs", 4096, NULL, 5, NULL);
     connect_wifi_nvs();
     start_webserver();
 
