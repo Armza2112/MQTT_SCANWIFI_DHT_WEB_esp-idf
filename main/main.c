@@ -37,7 +37,6 @@ void wifi_connect(const char *ssid, const char *password);
 void wifi_scan_task(void *pvParameters);
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 void add_sensor_reading(float temp, float hum, time_t timestamp);
-void mqtt_reconnect(void *pvParameters);
 esp_err_t restart_handle(httpd_req_t *req);
 esp_err_t connect_post_handler(httpd_req_t *req);
 esp_err_t connect_post_handler(httpd_req_t *req);
@@ -49,6 +48,7 @@ static const char *TAG_INFO = "INFO";
 static const char *TAG_RE = "Reconnect";
 static const char *TAG_MQTT = "MQTT";
 static const char *TAG_DHT22 = "DHT";
+static const char *TAG_SPIFFS = "SPIFFS";
 
 // declare var
 esp_mqtt_client_handle_t mqtt_client = NULL;
@@ -56,12 +56,11 @@ wifi_ap_record_t scanned_aps[MAXIMUM_AP];
 uint16_t scanned_ap_count = 0;
 TaskHandle_t main_task_handle = NULL;
 static EventGroupHandle_t wifi_event_group;
-static EventGroupHandle_t wifi_event_group;
-static volatile bool wifi_connect_failed = false;
 float temp_history[HISTORY_SIZE] = {NAN};
 float hum_history[HISTORY_SIZE] = {NAN};
 time_t time_history[HISTORY_SIZE] = {0};
 int history_index = 0;
+static bool user_disconnect = false;
 
 /* Spiffs */
 void init_spiffs()
@@ -142,46 +141,47 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         }
         case WIFI_EVENT_STA_DISCONNECTED:
         {
-            wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
-
-            ESP_LOGW("WIFI", "Disconnected from WiFi, reason: %d", event->reason);
-            switch (event->reason)
-            {
-            case WIFI_REASON_AUTH_FAIL:
-            case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
-            case WIFI_REASON_HANDSHAKE_TIMEOUT:
-                ESP_LOGE("WIFI", "Authentication failed. Possibly wrong password.");
-                break;
-
-            case WIFI_REASON_NO_AP_FOUND:
-                ESP_LOGE("WIFI", "SSID not found. Possibly wrong SSID or out of range.");
-                break;
-
-            default:
-                ESP_LOGW("WIFI", "Disconnected for unknown reason: %d", event->reason);
-                break;
-            }
-            wifi_connect_failed = true;
             xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
-
             char ssid[33] = {0}, password[65] = {0};
             size_t ssid_len = sizeof(ssid), pass_len = sizeof(password);
             nvs_handle_t nvs_handle;
-            if (nvs_open("wifi_creds", NVS_READONLY, &nvs_handle) == ESP_OK)
+            if (user_disconnect)
             {
-                if (nvs_get_str(nvs_handle, "ssid", ssid, &ssid_len) == ESP_OK &&
-                    nvs_get_str(nvs_handle, "password", password, &pass_len) == ESP_OK)
+                ESP_LOGI("WIFI", "User disconnect");
+                user_disconnect = false;
+                
+            }
+            else
+            {
+                if (nvs_open("wifi_creds", NVS_READONLY, &nvs_handle) == ESP_OK)
                 {
-                    wifi_config_t wifi_config = {};
-                    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-                    strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
-                    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-                    esp_wifi_connect();
-                    ESP_LOGI("WIFI", "Reconnecting to saved SSID: %s", ssid);
-                    esp_wifi_set_mode(WIFI_MODE_APSTA);
-                    vTaskDelay(pdMS_TO_TICKS(60000));
+                    if (nvs_get_str(nvs_handle, "ssid", ssid, &ssid_len) == ESP_OK &&
+                        nvs_get_str(nvs_handle, "password", password, &pass_len) == ESP_OK)
+                    {
+                        wifi_config_t wifi_config = {};
+                        strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+                        strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+                        esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+                        esp_wifi_connect();
+                        ESP_LOGI("WIFI", "Reconnecting to saved SSID: %s", ssid);
+                        vTaskDelay(pdMS_TO_TICKS(60000));
+                    }
+                    else
+                    {
+                        esp_wifi_set_mode(WIFI_MODE_APSTA);
+                        esp_wifi_start();
+                        vTaskDelay(pdMS_TO_TICKS(1000));
+                        xTaskCreate(wifi_scan_task, "wifi_scan_task", 8192, NULL, 5, NULL);
+                    }
+                    nvs_close(nvs_handle);
                 }
-                nvs_close(nvs_handle);
+                else
+                {
+                    esp_wifi_set_mode(WIFI_MODE_APSTA);
+                    esp_wifi_start();
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    xTaskCreate(wifi_scan_task, "wifi_scan_task", 8192, NULL, 5, NULL);
+                }
             }
             break;
         }
@@ -214,7 +214,6 @@ void wifi_connect(const char *ssid, const char *password)
 
     ESP_ERROR_CHECK(esp_wifi_connect());
 }
-
 
 static const char *auth_mode_type(wifi_auth_mode_t auth_mode)
 {
@@ -339,10 +338,8 @@ void wifi_scan_task(void *pvParameters)
             vTaskDelete(NULL);
             return;
         }
-
         ESP_LOGI(TAG_SCAN, "Found %d APs", ap_num);
-        vTaskDelay(pdMS_TO_TICKS(10000)); // delay 10 seconds
-
+        vTaskDelay(pdMS_TO_TICKS(5000));
         for (int i = 0; i < ap_num; i++)
         {
             char ssid[33] = {0};
@@ -401,6 +398,7 @@ void connect_wifi_nvs()
         else
         {
             ESP_LOGI(TAG_AP, "No wifi credentials in NVS");
+            xTaskCreate(wifi_scan_task, "wifi_scan_task", 8192, NULL, 5, NULL);
         }
         nvs_close(nvs_handle);
     }
@@ -586,10 +584,11 @@ esp_err_t wifi_manage(httpd_req_t *req)
 }
 void disconnect_wifi_task(void *pvParameter)
 {
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
     ESP_LOGI(TAG_AP, "Disconnect wifi task running");
     esp_wifi_disconnect();
+    user_disconnect = true;
     vTaskDelay(pdMS_TO_TICKS(1000));
     nvs_handle_t nvs_handle;
     if (nvs_open("wifi_creds", NVS_READWRITE, &nvs_handle) == ESP_OK)
@@ -599,7 +598,6 @@ void disconnect_wifi_task(void *pvParameter)
         nvs_commit(nvs_handle);
         nvs_close(nvs_handle);
     }
-
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_start();
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -749,36 +747,38 @@ esp_err_t connect_post_handler(httpd_req_t *req)
         password[len] = '\0';
     }
 
-    ESP_LOGI(TAG_AP, "Parsed SSID: %s, Password: %s", ssid, password);
+    ESP_LOGI(TAG_AP, "Parsed SSID: %s", ssid);
 
     wifi_connect(ssid, password);
-    if (wifi_connect_failed || !(xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT))
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+
+    if (bits & WIFI_CONNECTED_BIT)
     {
-        const char *fail_resp = "<!DOCTYPE html><html><body><h1>WiFi connection failed. Please check your password.</h1></body>"
-                                "<a href='/'>Back to Home</a></body></html>";
-        httpd_resp_send(req, fail_resp, HTTPD_RESP_USE_STRLEN);
-        return ESP_FAIL;
-    }
-    else
-    {
+        nvs_handle_t nvs_handle;
+        esp_err_t err = nvs_open("wifi_creds", NVS_READWRITE, &nvs_handle);
+        if (err == ESP_OK)
+        {
+            nvs_set_str(nvs_handle, "ssid", ssid);
+            nvs_set_str(nvs_handle, "password", password);
+            nvs_commit(nvs_handle);
+            nvs_close(nvs_handle);
+        }
+        else
+        {
+            ESP_LOGI(TAG_AP, "Fail to save in NVS%s", esp_err_to_name(err));
+        }
         const char *resp = "<!DOCTYPE html><html><body><h1>connecting WiFi...</h1></body>"
                            "<a href='/'>Back to Home</a></body></html>";
         httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     }
-
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("wifi_creds", NVS_READWRITE, &nvs_handle);
-    if (err == ESP_OK)
-    {
-        nvs_set_str(nvs_handle, "ssid", ssid);
-        nvs_set_str(nvs_handle, "password", password);
-        nvs_commit(nvs_handle);
-        nvs_close(nvs_handle);
-    }
     else
     {
-        ESP_LOGI(TAG_AP, "Fail to save in NVS%s", esp_err_to_name(err));
+        const char *resp = "<!DOCTYPE html><html><body><h1>Connect fail</h1>"
+                           "<p>Wrong password</p>"
+                           "<a href='/wifimanage'>Home</a></body></html>";
+        return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     }
+
     return ESP_OK;
 }
 esp_err_t restart_handle(httpd_req_t *req)
@@ -797,28 +797,38 @@ esp_err_t restart_handle(httpd_req_t *req)
 void read_dht()
 {
     setDHTgpio(DHT_GPIO);
-    vTaskDelay(pdMS_TO_TICKS(2000));
     setenv("TZ", "ICT-7", 1);
     tzset();
+    TickType_t xLastWakeTime = xTaskGetTickCount();
     while (1)
     {
         int ret = readDHT();
-
+        time_t now = time(NULL);
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        char timestamp[32];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
         errorHandler(ret);
         float temp = getTemperature();
         float hum = getHumidity();
 
         if ((!isnan(temp) && !isnan(hum)) && (temp != 0 && hum != 0))
         {
-            time_t now = time(NULL);
-            struct tm timeinfo;
-            char timestamp[32];
             char payload[200];
             snprintf(payload, sizeof(payload),
                      "{\"timestamp\": \"%s\", \"temperature\": %.2f, \"humidity\": %.2f}",
                      timestamp, temp, hum);
 
-            ESP_LOGI(TAG_MQTT, "Published payload: %s", payload);
+            ESP_LOGI(TAG_DHT22, "Published payload: %s", payload);
+
+            FILE *f = fopen("/spiffs/log.txt", "a");
+            if (f)
+            {
+                fprintf(f, "{\"time\":\"%s\",\"temp\":%.2f,\"hum\":%.2f}\n", timestamp, temp, hum);
+                fclose(f);
+                ESP_LOGI(TAG_SPIFFS, "Save to spiffs");
+            }
+
             add_sensor_reading(temp, hum, now);
         }
         else
@@ -854,20 +864,20 @@ void mqtt_init()
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(mqtt_client);
-    xTaskCreate(&mqtt_reconnect, "mqtt_reconnect", 4096, NULL, 5, NULL);
+    // xTaskCreate(&mqtt_reconnect, "mqtt_reconnect", 4096, NULL, 5, NULL);
 }
-void mqtt_reconnect(void *pvParameters)
-{
-    while (1)
-    {
-        if (!esp_mqtt_client_disconnect(mqtt_client))
-        {
-            ESP_LOGW("MQTT", "Not connected, reconnecting...");
-            esp_mqtt_client_reconnect(mqtt_client);
-        }
-        vTaskDelay(pdMS_TO_TICKS(60000)); 
-    }
-}
+// void mqtt_reconnect(void *pvParameters)
+// {
+//     while (1)
+//     {
+//         if (!esp_mqtt_client_disconnect(mqtt_client))
+//         {
+//             ESP_LOGW("MQTT", "Not connected, reconnecting...");
+//             esp_mqtt_client_reconnect(mqtt_client);
+//         }
+//         vTaskDelay(pdMS_TO_TICKS(60000));
+//     }
+// }
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
@@ -890,127 +900,37 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 }
 void mqtt_publish_task(void *pvParameters)
 {
-    setDHTgpio(DHT_GPIO);
-    ESP_LOGI(TAG_DHT22, "Starting DHT Task\n\n");
-    setenv("TZ", "ICT-7", 1);
-    tzset();
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    TickType_t xLastWakeTime = xTaskGetTickCount();
     while (1)
     {
-        for (int i = 0; i < HISTORY_SIZE; i++)
+        int last_index = (history_index - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+
+        if (time_history[last_index] != 0 &&
+            !isnan(temp_history[last_index]) &&
+            !isnan(hum_history[last_index]))
         {
-
-            int idx = (history_index + i) % HISTORY_SIZE;
-
-            if (time_history[idx] == 0)
-                continue;
-
             char timestamp[32];
             struct tm timeinfo;
-            localtime_r(&time_history[idx], &timeinfo);
+            localtime_r(&time_history[last_index], &timeinfo);
             strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
 
-            if (!isnan(temp_history[idx]) && !isnan(hum_history[idx]))
-            {
-                time_t now = time(NULL);
-                struct tm timeinfo;
-                char timestamp[32];
-                add_sensor_reading(temp_history[idx], hum_history[idx], now);
-                localtime_r(&now, &timeinfo);
-                strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+            char payload[200];
+            snprintf(payload, sizeof(payload),
+                     "{\"timestamp\": \"%s\", \"temperature\": %.2f, \"humidity\": %.2f}",
+                     timestamp, temp_history[last_index], hum_history[last_index]);
 
-                char payload[200];
-                snprintf(payload, sizeof(payload),
-                         "{\"timestamp\": \"%s\", \"temperature\": %.2f, \"humidity\": %.2f}",
-                         timestamp, temp_history[idx], hum_history[idx]);
-
-                ESP_LOGI(TAG_MQTT, "Published payload: %s", payload);
-                esp_mqtt_client_publish(mqtt_client, "sensor/dht", payload, 0, 1, 0);
-            }
-            else
-            {
-                ESP_LOGW("JSON", "Invalid value");
-            }
+            ESP_LOGI(TAG_MQTT, "Published payload: %s", payload);
+            esp_mqtt_client_publish(mqtt_client, "sensor/dht", payload, 0, 1, 0);
         }
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        else
+        {
+            ESP_LOGW("MQTT", "No valid data to publish");
+        }
+
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(60000)); // ทำให้ตรงรอบ
     }
 }
 
-void mqtt_sensor_to_spiffs()
-{
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    while (1)
-    {
-        for (int i = 0; i < HISTORY_SIZE; i++)
-        {
-
-            int idx = (history_index + i) % HISTORY_SIZE;
-
-            if (time_history[idx] == 0)
-                continue;
-
-            char timestamp[32];
-            struct tm timeinfo;
-            localtime_r(&time_history[idx], &timeinfo);
-            strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
-
-            FILE *f = fopen("/spiffs/log.txt", "a");
-            if (f)
-            {
-                fprintf(f, "{\"time\":\"%s\",\"temp\":%.2f,\"hum\":%.2f}\n", timestamp, temp_history[idx], hum_history[idx]);
-                fclose(f);
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(60000));
-    }
-}
-void log_to_mqtt()
-{
-    while (1)
-    {
-        FILE *f = fopen("/spiffs/log.txt", "r");
-        if (f == NULL)
-        {
-            ESP_LOGE("LOG", "Failed to open log.txt");
-            return;
-        }
-
-        char line[128];
-        char json[2048];
-        strcpy(json, "[");
-
-        bool first = true;
-
-        while (fgets(line, sizeof(line), f))
-        {
-            char time[64];
-            float temp, hum;
-
-            if (sscanf(line, "Time: %63[^T] Temp: %f Hum: %f", time, &temp, &hum) == 3)
-            {
-                if (!first)
-                    strcat(json, ",");
-                first = false;
-
-                char entry[256];
-                snprintf(entry, sizeof(entry),
-                         "{\"time\":\"%s\",\"temp\":%.2f,\"hum\":%.2f}",
-                         time, temp, hum);
-
-                strcat(json, entry);
-            }
-        }
-
-        strcat(json, "]");
-        fclose(f);
-
-        int msg_id = esp_mqtt_client_publish(mqtt_client, "/sensor/logs", json, 0, 1, 0);
-        ESP_LOGI("MQTT", "Sent JSON log via MQTT, msg_id=%d", msg_id);
-        vTaskDelay(pdMS_TO_TICKS(60000));
-    }
-}
 /*MQTT*/
 
 void app_main(void)
@@ -1022,12 +942,9 @@ void app_main(void)
     wifi_init_apsta();
     init_spiffs();
     xTaskCreate(&read_dht, "read_dht", 4096, NULL, 5, NULL);
-    xTaskCreate(&mqtt_sensor_to_spiffs, "mqtt_sensor_to_spiffs", 4096, NULL, 5, NULL);
     connect_wifi_nvs();
     start_webserver();
-
-    xTaskCreate(wifi_scan_task, "wifi_scan_task", 8192, NULL, 5, NULL);
+    // MQTT TASK
     mqtt_init();
     xTaskCreate(&mqtt_publish_task, "mqtt_publish_task", 4096, NULL, 5, NULL);
-    // xTaskCreate(&log_to_mqtt, "log_to_mqtt", 8192, NULL, 5, NULL);
 }
